@@ -36,12 +36,26 @@ async function startServer() {
   const server = createServer(app);
 
   // CORS middleware for frontend communication
+  // NOTE: Wildcard (*) blocks credentialed requests — must use explicit origin.
+  const ALLOWED_ORIGINS = new Set([
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://amar-jeans-frontend.vercel.app",
+    // Add any custom domains here
+  ]);
+
   app.use((req, res, next) => {
-    const origin = req.headers.origin || "*";
-    res.setHeader("Access-Control-Allow-Origin", origin);
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    } else if (!origin) {
+      // Non-browser requests (server-to-server, curl, etc.)
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    }
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.setHeader("Vary", "Origin"); // Important for CDN caching
     if (req.method === "OPTIONS") {
       return res.status(204).end();
     }

@@ -10,11 +10,22 @@ function isSecureRequest(req) {
   return protoList.some(proto => proto.trim().toLowerCase() === "https");
 }
 
+function isLocalRequest(req) {
+  const host = req.hostname || req.headers.host || "";
+  const bareHost = host.split(":")[0];
+  return LOCAL_HOSTS.has(bareHost);
+}
+
 export function getSessionCookieOptions(req) {
+  const isLocal = isLocalRequest(req);
+  const isSecure = !isLocal && (isSecureRequest(req) || ENV.isProduction);
+
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "lax",
-    secure: false,
+    // SameSite=None is REQUIRED for cross-origin cookies (Vercel → Render).
+    // SameSite=Lax only works same-site. None requires Secure=true.
+    sameSite: isLocal ? "lax" : "none",
+    secure: isSecure,
   };
 }
