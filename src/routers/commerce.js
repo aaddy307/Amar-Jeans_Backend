@@ -24,6 +24,21 @@ const cartLineUpdateSchema = z.object({
   quantity: z.number().int().min(0).max(99),
 });
 
+// Helper to map a raw Product mongo doc to frontend-ready shape
+function mapProduct(p) {
+  return {
+    ...p,
+    id: p._id.toString(),
+    vendor: p.brand,
+    productType: p.category ? p.category.name : "",
+    priceRange: { min: { amount: p.price.toString(), currencyCode: "INR" } },
+    variants: [{ id: p._id.toString() }],
+    images: (p.images && p.images.length > 0)
+      ? p.images
+      : (p.imageUrl ? [{ url: p.imageUrl, altText: p.title }] : [])
+  };
+}
+
 export const commerceRouter = router({
   /* -------------------------------------------------------------------------- */
   /*                                 PRODUCTS                                   */
@@ -32,24 +47,42 @@ export const commerceRouter = router({
     list: publicProcedure
       .input(z.object({
         categoryId: z.string().optional(),
+        gender: z.enum(['men', 'women', 'unisex']).optional(),
+        fit: z.string().optional(),
+        size: z.string().optional(),
+        color: z.string().optional(),
+        minPrice: z.number().optional(),
+        maxPrice: z.number().optional(),
+        isNew: z.boolean().optional(),
+        isBestseller: z.boolean().optional(),
+        isTrending: z.boolean().optional(),
+        search: z.string().optional(),
       }).optional())
       .query(async ({ input }) => {
-        let query = {};
-        if (input?.categoryId) {
-          query.category = input.categoryId;
+        const query = {};
+        if (input?.categoryId) query.category = input.categoryId;
+        if (input?.gender && input.gender !== 'unisex') query.gender = input.gender;
+        if (input?.fit) query.fit = input.fit;
+        if (input?.size) query.sizes = input.size;
+        if (input?.color) query.colors = input.color;
+        if (input?.isNew === true) query.isNew = true;
+        if (input?.isBestseller === true) query.isBestseller = true;
+        if (input?.isTrending === true) query.isTrending = true;
+        if (input?.minPrice !== undefined || input?.maxPrice !== undefined) {
+          query.price = {};
+          if (input?.minPrice !== undefined) query.price.$gte = input.minPrice;
+          if (input?.maxPrice !== undefined) query.price.$lte = input.maxPrice;
         }
+        if (input?.search) {
+          query.$or = [
+            { title: { $regex: input.search, $options: 'i' } },
+            { description: { $regex: input.search, $options: 'i' } },
+            { tags: { $regex: input.search, $options: 'i' } }
+          ];
+        }
+
         const products = await Product.find(query).populate('category', 'name slug').lean();
-        
-        // Map to match frontend expectations (Shopify style)
-        return products.map(p => ({
-          ...p,
-          id: p._id.toString(),
-          vendor: p.brand,
-          productType: p.category ? p.category.name : "",
-          priceRange: { min: { amount: p.price.toString(), currencyCode: "INR" } },
-          variants: [{ id: p._id.toString() }], // dummy variant ID for cart
-          images: (p.images && p.images.length > 0) ? p.images : (p.imageUrl ? [{ url: p.imageUrl, altText: p.title }] : [])
-        }));
+        return products.map(mapProduct);
       }),
 
     byHandle: publicProcedure
@@ -57,16 +90,16 @@ export const commerceRouter = router({
       .query(async ({ input }) => {
         const p = await Product.findOne({ handle: input.handle }).populate('category', 'name slug').lean();
         if (!p) return null;
-        
-        return {
-          ...p,
-          id: p._id.toString(),
-          vendor: p.brand,
-          productType: p.category ? p.category.name : "",
-          priceRange: { min: { amount: p.price.toString(), currencyCode: "INR" } },
-          variants: [{ id: p._id.toString() }],
-          images: (p.images && p.images.length > 0) ? p.images : (p.imageUrl ? [{ url: p.imageUrl, altText: p.title }] : [])
-        };
+        return mapProduct(p);
+      }),
+
+    related: publicProcedure
+      .input(z.object({ productId: z.string(), categoryId: z.string().optional() }))
+      .query(async ({ input }) => {
+        const query = { _id: { $ne: input.productId } };
+        if (input.categoryId) query.category = input.categoryId;
+        const products = await Product.find(query).limit(8).populate('category', 'name slug').lean();
+        return products.map(mapProduct);
       }),
   }),
 
@@ -76,9 +109,14 @@ export const commerceRouter = router({
   categories: router({
     list: publicProcedure.query(async () => {
       const categories = await Category.find().lean();
-      return categories.map(c => ({
+      // Get product count per category
+      const counts = await Promise.all(
+        categories.map(c => Product.countDocuments({ category: c._id }))
+      );
+      return categories.map((c, i) => ({
         ...c,
-        id: c._id.toString()
+        id: c._id.toString(),
+        productCount: counts[i]
       }));
     }),
   }),
@@ -99,7 +137,7 @@ export const commerceRouter = router({
       .query(async () => {
         return await Review.find()
           .sort({ createdAt: -1 })
-          .limit(10)
+          .limit(12)
           .populate('product', 'title images handle')
           .lean();
       }),
@@ -111,7 +149,7 @@ export const commerceRouter = router({
         rating: z.number().min(1).max(5),
         comment: z.string().min(1)
       }))
-      .mutation(async ({ input, ctx }) => {
+      .mutation(async ({ input }) => {
         const review = await Review.create({
           product: input.productId,
           authorName: input.authorName,
@@ -149,7 +187,6 @@ export const commerceRouter = router({
       .mutation(async ({ input }) => {
         const toRemove = input.lines.filter(l => l.quantity === 0).map(l => l.lineId);
         const toUpdate = input.lines.filter(l => l.quantity > 0);
-
         let cart = null;
         if (toUpdate.length) cart = await updateCartLines(input.cartId, toUpdate);
         if (toRemove.length) cart = await removeCartLines(input.cartId, toRemove);
@@ -172,15 +209,7 @@ export const commerceRouter = router({
     get: protectedProcedure.query(async ({ ctx }) => {
       const user = await User.findById(ctx.user.id).populate('wishlist').lean();
       if (!user || !user.wishlist) return [];
-      
-      return user.wishlist.map(p => ({
-        ...p,
-        id: p._id.toString(),
-        vendor: p.brand,
-        productType: p.category ? p.category.name : "",
-        priceRange: { min: { amount: p.price.toString(), currencyCode: "INR" } },
-        variants: [{ id: p._id.toString() }]
-      }));
+      return user.wishlist.map(p => mapProduct(p));
     }),
 
     toggle: protectedProcedure
@@ -188,7 +217,6 @@ export const commerceRouter = router({
       .mutation(async ({ input, ctx }) => {
         const user = await User.findById(ctx.user.id);
         if (!user) throw new TRPCError({ code: "NOT_FOUND", message: "User not found" });
-
         const index = user.wishlist.indexOf(input.productId);
         if (index === -1) {
           user.wishlist.push(input.productId);
@@ -215,6 +243,8 @@ export const commerceRouter = router({
         totalPrice: z.string().optional().default("0"),
         notes: z.string().optional().default(""),
         orderType: z.enum(["order", "enquiry"]).optional().default("enquiry"),
+        couponCode: z.string().optional().default(""),
+        discountAmount: z.string().optional().default("0"),
         items: z.array(z.object({
           productId: z.string().optional(),
           title: z.string().optional(),
@@ -227,7 +257,6 @@ export const commerceRouter = router({
       .mutation(async ({ input, ctx }) => {
         const prefix = input.orderType === "enquiry" ? "ENQ-" : "ORD-";
         const orderNumber = prefix + Math.floor(100000 + Math.random() * 900000);
-        
         const order = await Order.create({
           userId: ctx.user?.id || undefined,
           orderNumber,
@@ -243,16 +272,94 @@ export const commerceRouter = router({
           items: input.items,
           notes: input.notes
         });
-
-        return { 
-          success: true, 
+        return {
+          success: true,
           orderId: order._id.toString(),
           orderNumber: order.orderNumber,
-          message: input.orderType === "enquiry" ? "Enquiry submitted successfully! Our team will contact you shortly." : "Order placed successfully!"
+          message: input.orderType === "enquiry"
+            ? "Enquiry submitted successfully! Our team will contact you shortly."
+            : "Order placed successfully!"
         };
       })
   }),
 
+  /* -------------------------------------------------------------------------- */
+  /*                                COUPONS                                     */
+  /* -------------------------------------------------------------------------- */
+  coupons: router({
+    validate: publicProcedure
+      .input(z.object({
+        code: z.string().min(1),
+        cartTotal: z.number()
+      }))
+      .query(async ({ input }) => {
+        const { Coupon } = await import("../models/Coupon.js");
+        const coupon = await Coupon.findOne({ code: input.code.toUpperCase().trim(), active: true }).lean();
+        if (!coupon) return { valid: false, message: "Invalid coupon code" };
+        if (coupon.expiresAt && new Date(coupon.expiresAt) < new Date()) {
+          return { valid: false, message: "Coupon has expired" };
+        }
+        if (coupon.maxUses > 0 && coupon.usedCount >= coupon.maxUses) {
+          return { valid: false, message: "Coupon usage limit reached" };
+        }
+        if (input.cartTotal < coupon.minCartValue) {
+          return { valid: false, message: `Minimum cart value ₹${coupon.minCartValue} required` };
+        }
+        const discount = coupon.discountType === 'percent'
+          ? Math.floor(input.cartTotal * coupon.discountValue / 100)
+          : coupon.discountValue;
+        return {
+          valid: true,
+          discountType: coupon.discountType,
+          discountValue: coupon.discountValue,
+          discount,
+          message: `Coupon applied! You save ₹${discount}`
+        };
+      }),
+  }),
+
+  /* -------------------------------------------------------------------------- */
+  /*                                  BLOG                                      */
+  /* -------------------------------------------------------------------------- */
+  blog: router({
+    list: publicProcedure.query(async () => {
+      const { BlogPost } = await import("../models/BlogPost.js");
+      const posts = await BlogPost.find({ published: true }).sort({ createdAt: -1 }).lean();
+      return posts.map(p => ({ ...p, id: p._id.toString() }));
+    }),
+
+    bySlug: publicProcedure
+      .input(z.object({ slug: z.string().min(1) }))
+      .query(async ({ input }) => {
+        const { BlogPost } = await import("../models/BlogPost.js");
+        const post = await BlogPost.findOne({ slug: input.slug, published: true }).lean();
+        if (!post) return null;
+        return { ...post, id: post._id.toString() };
+      }),
+  }),
+
+  /* -------------------------------------------------------------------------- */
+  /*                               NEWSLETTER                                   */
+  /* -------------------------------------------------------------------------- */
+  newsletter: router({
+    subscribe: publicProcedure
+      .input(z.object({
+        email: z.string().email(),
+        phone: z.string().optional().default("")
+      }))
+      .mutation(async ({ input }) => {
+        const { NewsletterSubscriber } = await import("../models/NewsletterSubscriber.js");
+        try {
+          await NewsletterSubscriber.create({ email: input.email, phone: input.phone });
+          return { success: true, message: "You're subscribed! Welcome to the Amar Jeans family." };
+        } catch (err) {
+          if (err.code === 11000) {
+            return { success: true, message: "You're already subscribed!" };
+          }
+          throw err;
+        }
+      }),
+  }),
 
   /* -------------------------------------------------------------------------- */
   /*                               SETTINGS                                     */

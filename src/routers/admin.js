@@ -83,13 +83,24 @@ export const adminRouter = router({
       price: z.number().positive(),
       compareAtPrice: z.number().positive().nullable().optional(),
       isTrending: z.boolean().optional().default(false),
+      isNew: z.boolean().optional().default(false),
+      isBestseller: z.boolean().optional().default(false),
+      gender: z.enum(['men','women','unisex']).optional().default('unisex'),
+      fit: z.string().optional().default('regular'),
+      sizes: z.array(z.string()).optional().default(['28','30','32','34','36','38']),
+      colors: z.array(z.string()).optional().default([]),
       categoryId: z.string(),
       imageUrl: z.preprocess(v => (v === "" || v == null) ? undefined : v, z.string().url().optional()),
+      hoverImageUrl: z.preprocess(v => (v === "" || v == null) ? undefined : v, z.string().url().optional()),
       tags: z.array(z.string()).optional()
     }))
     .mutation(async ({ input, ctx }) => {
       const existing = await Product.findOne({ handle: input.handle });
       if (existing) throw new TRPCError({ code: "CONFLICT", message: "Product handle already exists" });
+
+      const images = [];
+      if (input.imageUrl) images.push({ url: input.imageUrl, altText: input.title });
+      if (input.hoverImageUrl) images.push({ url: input.hoverImageUrl, altText: `${input.title} hover` });
 
       const newProduct = await Product.create({
         title: input.title,
@@ -98,8 +109,14 @@ export const adminRouter = router({
         price: input.price,
         compareAtPrice: input.compareAtPrice,
         isTrending: input.isTrending,
+        isNew: input.isNew,
+        isBestseller: input.isBestseller,
+        gender: input.gender,
+        fit: input.fit,
+        sizes: input.sizes,
+        colors: input.colors,
         category: input.categoryId,
-        images: input.imageUrl ? [{ url: input.imageUrl, altText: input.title }] : [],
+        images,
         tags: input.tags || []
       });
 
@@ -138,25 +155,41 @@ export const adminRouter = router({
       price: z.number().positive(),
       compareAtPrice: z.number().positive().nullable().optional(),
       isTrending: z.boolean().optional().default(false),
+      isNew: z.boolean().optional().default(false),
+      isBestseller: z.boolean().optional().default(false),
+      gender: z.enum(['men','women','unisex']).optional().default('unisex'),
+      fit: z.string().optional().default('regular'),
+      sizes: z.array(z.string()).optional().default(['28','30','32','34','36','38']),
+      colors: z.array(z.string()).optional().default([]),
       categoryId: z.string(),
       imageUrl: z.preprocess(v => (v === "" || v == null) ? undefined : v, z.string().url().optional()),
+      hoverImageUrl: z.preprocess(v => (v === "" || v == null) ? undefined : v, z.string().url().optional()),
       tags: z.array(z.string()).optional()
     }))
     .mutation(async ({ input, ctx }) => {
-      const updated = await Product.findByIdAndUpdate(
-        input.productId,
-        {
-          title: input.title,
-          description: input.description,
-          price: input.price,
-          compareAtPrice: input.compareAtPrice,
-          isTrending: input.isTrending,
-          category: input.categoryId,
-          ...(input.imageUrl && { images: [{ url: input.imageUrl, altText: input.title }] }),
-          tags: input.tags || []
-        },
-        { new: true }
-      );
+      const updateData = {
+        title: input.title,
+        description: input.description,
+        price: input.price,
+        compareAtPrice: input.compareAtPrice,
+        isTrending: input.isTrending,
+        isNew: input.isNew,
+        isBestseller: input.isBestseller,
+        gender: input.gender,
+        fit: input.fit,
+        sizes: input.sizes,
+        colors: input.colors,
+        category: input.categoryId,
+        tags: input.tags || []
+      };
+      // Build images array if URLs provided
+      if (input.imageUrl || input.hoverImageUrl) {
+        const images = [];
+        if (input.imageUrl) images.push({ url: input.imageUrl, altText: input.title });
+        if (input.hoverImageUrl) images.push({ url: input.hoverImageUrl, altText: `${input.title} hover` });
+        updateData.images = images;
+      }
+      const updated = await Product.findByIdAndUpdate(input.productId, updateData, { new: true });
       if (!updated) throw new TRPCError({ code: "NOT_FOUND", message: "Product not found" });
 
       await AdminLog.create({
@@ -375,20 +408,26 @@ export const adminRouter = router({
       supportPhone: z.string().min(1),
       storeAddress: z.string().min(1),
       instagramUrl: z.string().url().or(z.literal('')),
-      whatsappNumber: z.string().min(1)
+      whatsappNumber: z.string().min(1),
+      announcementMessages: z.array(z.object({
+        text: z.string(),
+        link: z.string().optional().default(''),
+        active: z.boolean().optional().default(true)
+      })).optional(),
+      freeShippingThreshold: z.number().optional()
     }))
     .mutation(async ({ input, ctx }) => {
       const { SiteSettings } = await import("../models/SiteSettings.js");
       const settings = await SiteSettings.getSettings();
-      
       settings.storeName = input.storeName;
       settings.supportEmail = input.supportEmail;
       settings.supportPhone = input.supportPhone;
       settings.storeAddress = input.storeAddress;
       settings.instagramUrl = input.instagramUrl;
       settings.whatsappNumber = input.whatsappNumber;
+      if (input.announcementMessages) settings.announcementMessages = input.announcementMessages;
+      if (input.freeShippingThreshold !== undefined) settings.freeShippingThreshold = input.freeShippingThreshold;
       await settings.save();
-
       await AdminLog.create({
         adminId: ctx.user._id || ctx.user.id,
         action: "UPDATE_SETTINGS",
@@ -396,7 +435,111 @@ export const adminRouter = router({
         entityId: settings._id,
         details: "Updated global store settings",
       });
-
       return { success: true, settings };
     }),
+
+  /* -------------------------------------------------------------------------- */
+  /*                                 BLOG CRUD                                  */
+  /* -------------------------------------------------------------------------- */
+  getBlogPosts: adminProcedure.query(async () => {
+    const { BlogPost } = await import("../models/BlogPost.js");
+    return (await BlogPost.find().sort({ createdAt: -1 }).lean()).map(p => ({ ...p, id: p._id.toString() }));
+  }),
+
+  createBlogPost: adminProcedure
+    .input(z.object({
+      title: z.string().min(1),
+      slug: z.string().min(1),
+      excerpt: z.string().optional().default(''),
+      content: z.string().optional().default(''),
+      coverImage: z.string().optional().default(''),
+      tags: z.array(z.string()).optional().default([]),
+      published: z.boolean().optional().default(false),
+      author: z.string().optional().default('Amar Jeans Team')
+    }))
+    .mutation(async ({ input }) => {
+      const { BlogPost } = await import("../models/BlogPost.js");
+      const post = await BlogPost.create(input);
+      return { success: true, post };
+    }),
+
+  updateBlogPost: adminProcedure
+    .input(z.object({
+      postId: z.string(),
+      title: z.string().min(1).optional(),
+      excerpt: z.string().optional(),
+      content: z.string().optional(),
+      coverImage: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      published: z.boolean().optional(),
+      author: z.string().optional()
+    }))
+    .mutation(async ({ input }) => {
+      const { BlogPost } = await import("../models/BlogPost.js");
+      const { postId, ...updates } = input;
+      const post = await BlogPost.findByIdAndUpdate(postId, updates, { new: true });
+      if (!post) throw new TRPCError({ code: 'NOT_FOUND', message: 'Blog post not found' });
+      return { success: true, post };
+    }),
+
+  deleteBlogPost: adminProcedure
+    .input(z.object({ postId: z.string() }))
+    .mutation(async ({ input }) => {
+      const { BlogPost } = await import("../models/BlogPost.js");
+      await BlogPost.findByIdAndDelete(input.postId);
+      return { success: true };
+    }),
+
+  /* -------------------------------------------------------------------------- */
+  /*                                COUPON CRUD                                 */
+  /* -------------------------------------------------------------------------- */
+  getCoupons: adminProcedure.query(async () => {
+    const { Coupon } = await import("../models/Coupon.js");
+    return (await Coupon.find().sort({ createdAt: -1 }).lean()).map(c => ({ ...c, id: c._id.toString() }));
+  }),
+
+  createCoupon: adminProcedure
+    .input(z.object({
+      code: z.string().min(1),
+      discountType: z.enum(['percent', 'flat']).default('percent'),
+      discountValue: z.number().positive(),
+      minCartValue: z.number().optional().default(0),
+      maxUses: z.number().optional().default(0),
+      active: z.boolean().optional().default(true),
+      expiresAt: z.string().optional().nullable()
+    }))
+    .mutation(async ({ input }) => {
+      const { Coupon } = await import("../models/Coupon.js");
+      const coupon = await Coupon.create({
+        ...input,
+        code: input.code.toUpperCase(),
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : null
+      });
+      return { success: true, coupon };
+    }),
+
+  deleteCoupon: adminProcedure
+    .input(z.object({ couponId: z.string() }))
+    .mutation(async ({ input }) => {
+      const { Coupon } = await import("../models/Coupon.js");
+      await Coupon.findByIdAndDelete(input.couponId);
+      return { success: true };
+    }),
+
+  toggleCoupon: adminProcedure
+    .input(z.object({ couponId: z.string(), active: z.boolean() }))
+    .mutation(async ({ input }) => {
+      const { Coupon } = await import("../models/Coupon.js");
+      await Coupon.findByIdAndUpdate(input.couponId, { active: input.active });
+      return { success: true };
+    }),
+
+  /* -------------------------------------------------------------------------- */
+  /*                            NEWSLETTER SUBSCRIBERS                          */
+  /* -------------------------------------------------------------------------- */
+  getNewsletterSubscribers: adminProcedure.query(async () => {
+    const { NewsletterSubscriber } = await import("../models/NewsletterSubscriber.js");
+    return (await NewsletterSubscriber.find().sort({ createdAt: -1 }).lean())
+      .map(s => ({ ...s, id: s._id.toString() }));
+  }),
 });
