@@ -37,11 +37,11 @@ async function startServer() {
 
   // CORS middleware for frontend communication
   // NOTE: Wildcard (*) blocks credentialed requests — must use explicit origin.
+  // To change the allowed frontend URL, update FRONTEND_URL in your .env file.
   const ALLOWED_ORIGINS = new Set([
     "http://localhost:3000",
     "http://localhost:3001",
-    "https://amar-jeans-frontend.vercel.app",
-    // Add any custom domains here
+    ENV.frontendUrl,   // ← comes from FRONTEND_URL in .env
   ]);
 
   app.use((req, res, next) => {
